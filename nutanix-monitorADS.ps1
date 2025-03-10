@@ -66,19 +66,23 @@ function Initialize-NutanixConnection {
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
             
             # Get credentials
-            $credentials = Get-Credential -Message:"Enter credentials for Nutanix Prism Central"
+            Write-Host "Enter credentials for Nutanix Prism Central"
+            $credentials = Get-Credential
+            
+            # Create auth header
+            $authHeader = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(("{0}:{1}" -f $credentials.UserName, $credentials.GetNetworkCredential().Password)))
             
             # Set up connection details
             $connectionInfo = @{
                 BaseUrl = "https://{0}:9440/api/nutanix/v3" -f $PrismCentralAddress
-                Credentials = $credentials
                 Headers = @{
                     "Content-Type" = "application/json"
                     "Accept" = "application/json"
+                    "Authorization" = "Basic $authHeader"
                 }
             }
             
-            Write-Verbose -Message "Connection initialized for Nutanix Prism Central at $PrismCentralAddress"
+            Write-Verbose -Message ("Connection initialized for Nutanix Prism Central at {0}" -f $PrismCentralAddress)
             return $connectionInfo
         }
         catch {
@@ -127,7 +131,6 @@ function Invoke-NutanixApiRequest {
                     Uri = $uri
                     Method = $Method
                     Headers = $ConnectionInfo.Headers
-                    Credential = $ConnectionInfo.Credentials
                     ContentType = "application/json"
                     UseBasicParsing = $true
                     ErrorAction = "Stop"
@@ -143,37 +146,40 @@ function Invoke-NutanixApiRequest {
                     $response = Invoke-RestMethod @params
                 }
                 else {
-                    Add-Type -TypeDefinition @"
-                    using System.Net;
-                    using System.Security.Cryptography.X509Certificates;
-                    public class TrustAllCertsPolicy : ICertificatePolicy {
-                        public bool CheckValidationResult(
-                            ServicePoint srvPoint, X509Certificate certificate,
-                            WebRequest request, int certificateProblem) {
-                            return true;
+                    # Ignore certificate validation for PowerShell 5.1
+                    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
+                        Add-Type -TypeDefinition @"
+                        using System.Net;
+                        using System.Security.Cryptography.X509Certificates;
+                        public class TrustAllCertsPolicy : ICertificatePolicy {
+                            public bool CheckValidationResult(
+                                ServicePoint srvPoint, X509Certificate certificate,
+                                WebRequest request, int certificateProblem) {
+                                return true;
+                            }
                         }
-                    }
 "@
+                    }
                     [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
                     $response = Invoke-RestMethod @params
                 }
                 
                 $success = $true
                 $result = $response
-                Write-Verbose -Message "API request to $Endpoint successful"
+                Write-Verbose -Message ("API request to {0} successful" -f $Endpoint)
             }
             catch {
                 $errorMessage = "Attempt {0}/{1}: API request to {2} failed: {3}" -f $attemptCount, $MaxAttempts, $Endpoint, $_.Exception.Message
                 Write-Warning -Message $errorMessage
                 
                 if ($attemptCount -ge $MaxAttempts) {
-                    Write-Error -Message "Maximum retry attempts reached for API request to $Endpoint"
+                    Write-Error -Message ("Maximum retry attempts reached for API request to {0}" -f $Endpoint)
                     throw $_
                 }
                 
                 # Wait before retrying with exponential backoff
                 $backoffSeconds = [math]::Pow(2, $attemptCount)
-                Write-Verbose -Message "Waiting {0} seconds before retry..." -f $backoffSeconds
+                Write-Verbose -Message ("Waiting {0} seconds before retry..." -f $backoffSeconds)
                 Start-Sleep -Seconds $backoffSeconds
             }
         }
@@ -333,7 +339,7 @@ function Export-ChangesToCsv {
                 # Export to CSV
                 $Changes | Export-Csv -Path $CsvPath -NoTypeInformation -Append:$fileExists
                 
-                Write-Verbose -Message "{0} VM host changes exported to {1}" -f $Changes.Count, $CsvPath
+                Write-Verbose -Message ("{0} VM host changes exported to {1}" -f $Changes.Count, $CsvPath)
             }
             else {
                 Write-Verbose -Message "No VM host changes to export"
