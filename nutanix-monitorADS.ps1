@@ -81,14 +81,17 @@ function Connect-NutanixAPI {
     process {
         try {
             Write-Verbose "Prompting for Nutanix credentials"
-            $credentials = Get-Credential -Message "Enter credentials for Nutanix Prism Central ($PrismCentralAddress)"
+            $promptMessage = "Enter credentials for Nutanix Prism Central ($PrismCentralAddress)"
+            $credentials = Get-Credential -Message $promptMessage
             
             if (-not $credentials) {
                 throw "Credentials are required to connect to Nutanix Prism Central"
             }
             
-            $base64AuthInfo = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(
-                "{0}:{1}" -f $credentials.UserName, $credentials.GetNetworkCredential().Password))
+            $username = $credentials.UserName
+            $password = $credentials.GetNetworkCredential().Password
+            $authString = "$username`:$password"
+            $base64AuthInfo = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($authString))
             
             $script:Headers = @{
                 "Authorization" = "Basic $base64AuthInfo"
@@ -268,7 +271,8 @@ function Get-NutanixVMDetails {
     
     process {
         try {
-            Write-Verbose "Processing VM details for $($VMs.Count) VMs"
+            $vmCount = $VMs.Count
+            Write-Verbose "Processing VM details for $vmCount VMs"
             
             $vmDetails = @()
             
@@ -380,7 +384,8 @@ function Export-MigrationsToCsv {
             # Append migrations to the CSV file
             $Migrations | Export-Csv -Path $CsvFilePath -NoTypeInformation -Append
             
-            Write-Verbose "Successfully exported $($Migrations.Count) migrations to CSV"
+            $migrationCount = $Migrations.Count
+            Write-Verbose "Successfully exported $migrationCount migrations to CSV"
         }
         catch {
             Write-Error "Failed to export migrations to CSV: $_"
@@ -451,9 +456,10 @@ function Start-VMHostMigrationMonitor {
                     $migrations = Compare-VMHostMigrations -CurrentVMDetails $currentVMDetails -PreviousVMDetails $previousVMDetails -PrismCentralAddress $PrismCentralAddress
                     
                     # If there are migrations, report and export them
+                    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
                     if ($migrations.Count -gt 0) {
-                        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-                        Write-Host "$($migrations.Count) VM migrations detected at $timestamp"
+                        $migrationCount = $migrations.Count
+                        Write-Host "$migrationCount VM migrations detected at $timestamp"
                         
                         foreach ($migration in $migrations) {
                             Write-Host "VM: $($migration.VMName) | CPU: $($migration.VMCpuUsage)% | New Host: $($migration.HostName_New) | Previous Host: $($migration.HostName_Previous) | Cluster: $($migration.ClusterName)"
@@ -462,7 +468,6 @@ function Start-VMHostMigrationMonitor {
                         Export-MigrationsToCsv -Migrations $migrations -CsvFilePath $CsvFilePath
                     }
                     else {
-                        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
                         Write-Host "No VM migrations detected at $timestamp"
                     }
                 }
