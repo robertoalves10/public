@@ -145,12 +145,13 @@ function Invoke-NutanixApiCall {
         catch {
             if ($attempt -lt $MaxAttempts) {
                 $statusCode = $_.Exception.Response.StatusCode.value__
-                Write-LogMessage -Message "Attempt $attempt of $MaxAttempts failed with status code $statusCode. Retrying in $RetryDelaySeconds seconds..." -Level 'WARNING'
+                $warningMsg = "Attempt $attempt of $MaxAttempts failed with status code $statusCode. Retrying in $RetryDelaySeconds seconds..."
+                Write-LogMessage -Message $warningMsg -Level 'WARNING'
                 Start-Sleep -Seconds $RetryDelaySeconds
                 $attempt++
             }
             else {
-                $errorDetails = "Status code: {0}, Message: {1}" -f $_.Exception.Response.StatusCode.value__, $_.Exception.Message
+                $errorDetails = "Status code: $($_.Exception.Response.StatusCode.value__), Message: $($_.Exception.Message)"
                 Write-LogMessage -Message "API call failed after $MaxAttempts attempts: $errorDetails" -Level 'ERROR'
                 throw "Failed to call Nutanix API: $errorDetails"
             }
@@ -269,7 +270,7 @@ function Save-DataToJson {
 
     try {
         $Data | ConvertTo-Json -Depth 10 | Out-File -FilePath $FilePath -Force
-        Write-LogMessage -Message "Data saved to JSON file: {0}" -f $FilePath
+        Write-LogMessage -Message "Data saved to JSON file: $FilePath"
         return $true
     }
     catch {
@@ -288,11 +289,11 @@ function Get-DataFromJson {
     try {
         if (Test-Path -Path $FilePath) {
             $data = Get-Content -Path $FilePath -Raw | ConvertFrom-Json
-            Write-LogMessage -Message "Successfully loaded data from JSON file: {0}" -f $FilePath
+            Write-LogMessage -Message "Successfully loaded data from JSON file: $FilePath"
             return $data
         }
         else {
-            Write-LogMessage -Message "JSON file not found: {0}" -f $FilePath -Level 'WARNING'
+            Write-LogMessage -Message "JSON file not found: $FilePath" -Level 'WARNING'
             return $null
         }
     }
@@ -320,10 +321,10 @@ function Save-MigrationToCsv {
         $Migration | Export-Csv -Path $FilePath -NoTypeInformation -Append -Force
         
         if (-not $fileExists) {
-            Write-LogMessage -Message "Created new CSV file: {0}" -f $FilePath
+            Write-LogMessage -Message "Created new CSV file: $FilePath"
         }
         
-        Write-LogMessage -Message "Migration record saved to CSV file: {0}" -f $FilePath
+        Write-LogMessage -Message "Migration record saved to CSV file: $FilePath"
     }
     catch {
         Write-LogMessage -Message "Error saving migration to CSV file: $_" -Level 'ERROR'
@@ -368,7 +369,8 @@ function Compare-VMHosts {
             Save-MigrationToCsv -Migration $migration -FilePath $CsvFilePath
             
             # Output to console
-            Write-LogMessage -Message "VM Migration Detected: {0} moved from {1} to {2}" -f $migration.VMName, $migration.HostName_Previous, $migration.HostName_New
+            $logMsg = "VM Migration Detected: $($migration.VMName) moved from $($migration.HostName_Previous) to $($migration.HostName_New)"
+            Write-LogMessage -Message $logMsg
         }
     }
     
@@ -384,17 +386,17 @@ function Get-LatestJsonFile {
 
     try {
         # Search for any file matching the pattern
-        $filePattern = "{0}_*.json" -f $BaseFileName
+        $filePattern = "$($BaseFileName)_*.json"
         $files = Get-ChildItem -Path $filePattern -ErrorAction SilentlyContinue
         
         if ($files -and $files.Count -gt 0) {
             # Get the most recent file
             $latestFile = $files | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-            Write-LogMessage -Message "Found latest JSON file: {0}" -f $latestFile.Name
+            Write-LogMessage -Message "Found latest JSON file: $($latestFile.Name)"
             return $latestFile.FullName
         }
         else {
-            Write-LogMessage -Message "No previous JSON files found matching pattern: {0}" -f $filePattern -Level 'WARNING'
+            Write-LogMessage -Message "No previous JSON files found matching pattern: $filePattern" -Level 'WARNING'
             return $null
         }
     }
@@ -410,7 +412,8 @@ function Get-LatestJsonFile {
 
 try {
     Write-LogMessage -Message "Starting Nutanix VM Migration Monitor"
-    Write-LogMessage -Message "Prism Central: {0}, CSV File: {1}, Interval: {2} min, Max Runtime: {3} min" -f $PrismCentralAddress, $CsvFileName, $DataRetrievalInterval, $MaxScriptRuntimeMin
+    $startMsg = "Prism Central: $PrismCentralAddress, CSV File: $CsvFileName, Interval: $DataRetrievalInterval min, Max Runtime: $MaxScriptRuntimeMin min"
+    Write-LogMessage -Message $startMsg
     
     # Get credentials
     $credential = Get-Credential
@@ -419,14 +422,14 @@ try {
     $scriptStartTime = Get-Date
     $previousVMs = @()
     $jsonBaseFileName = "NutanixVMData"
-    $currentJsonFilePath = "{0}_{1}.json" -f $jsonBaseFileName, (Get-Date -Format "yyyyMMdd_HHmmss")
+    $currentJsonFilePath = "$($jsonBaseFileName)_$(Get-Date -Format "yyyyMMdd_HHmmss").json"
     
     # Check for previous JSON file to load as baseline
     $previousJsonFilePath = Get-LatestJsonFile -BaseFileName $jsonBaseFileName
     if ($previousJsonFilePath) {
         $previousVMs = Get-DataFromJson -FilePath $previousJsonFilePath
         if ($previousVMs) {
-            Write-LogMessage -Message "Loaded {0} VMs from previous JSON file as baseline" -f $previousVMs.Count
+            Write-LogMessage -Message "Loaded $($previousVMs.Count) VMs from previous JSON file as baseline"
         }
     }
     
@@ -437,7 +440,7 @@ try {
         
         # Check if maximum script runtime has been reached
         if ($elapsedMinutes -ge $MaxScriptRuntimeMin) {
-            Write-LogMessage -Message "Maximum script runtime of {0} minutes reached. Exiting." -f $MaxScriptRuntimeMin
+            Write-LogMessage -Message "Maximum script runtime of $MaxScriptRuntimeMin minutes reached. Exiting."
             break
         }
         
@@ -457,7 +460,7 @@ try {
                 
                 # Count of detected migrations
                 $migrationCount = if ($migrations) { $migrations.Count } else { 0 }
-                Write-LogMessage -Message "Detected {0} VM migrations in this cycle" -f $migrationCount
+                Write-LogMessage -Message "Detected $migrationCount VM migrations in this cycle"
             }
             else {
                 Write-LogMessage -Message "First run, establishing baseline VM host data."
@@ -468,14 +471,14 @@ try {
             
             # Update JSON filename for next iteration (keep one file per hour to avoid too many files)
             if ((Get-Date).Minute -eq 0) {
-                $currentJsonFilePath = "{0}_{1}.json" -f $jsonBaseFileName, (Get-Date -Format "yyyyMMdd_HHmmss")
+                $currentJsonFilePath = "$($jsonBaseFileName)_$(Get-Date -Format "yyyyMMdd_HHmmss").json"
             }
             
             # Wait for next interval
             $nextRunTime = $currentTime.AddMinutes($DataRetrievalInterval)
             $waitSeconds = [math]::Max(1, ($nextRunTime - (Get-Date)).TotalSeconds)
             
-            Write-LogMessage -Message "Next check in {0} seconds at {1}" -f [math]::Round($waitSeconds), $nextRunTime.ToString("HH:mm:ss")
+            Write-LogMessage -Message "Next check in $([math]::Round($waitSeconds)) seconds at $($nextRunTime.ToString("HH:mm:ss"))"
             Start-Sleep -Seconds $waitSeconds
         }
         catch {
@@ -487,7 +490,7 @@ try {
                 if ($lastJsonFile) {
                     $previousVMs = Get-DataFromJson -FilePath $lastJsonFile
                     if ($previousVMs) {
-                        Write-LogMessage -Message "Recovered {0} VMs from JSON file after error" -f $previousVMs.Count
+                        Write-LogMessage -Message "Recovered $($previousVMs.Count) VMs from JSON file after error"
                     }
                 }
             }
