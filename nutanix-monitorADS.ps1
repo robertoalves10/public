@@ -66,7 +66,7 @@ function Initialize-NutanixConnection {
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
             
             # Get credentials
-            $credentials = Get-Credential -Message "Enter credentials for Nutanix Prism Central"
+            $credentials = Get-Credential -Message:"Enter credentials for Nutanix Prism Central"
             
             # Set up connection details
             $connectionInfo = @{
