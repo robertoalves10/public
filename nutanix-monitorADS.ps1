@@ -96,11 +96,11 @@ function Connect-NutanixAPI {
                 "Accept" = "application/json"
             }
             
-            $apiBase = "https://{0}:9440/api/nutanix/v3" -f $PrismCentralAddress
+            $apiBase = "https://$PrismCentralAddress`:9440/api/nutanix/v3"
             $script:ApiBaseUrl = $apiBase
             
             # Test connection
-            $testUrl = "{0}/clusters" -f $apiBase
+            $testUrl = "$apiBase/clusters"
             $testParams = @{
                 Method = "GET"
                 Uri = $testUrl
@@ -132,7 +132,7 @@ function Get-NutanixClusterInfo {
         try {
             Write-Verbose "Retrieving Nutanix cluster information"
             
-            $clusterUrl = "{0}/clusters/list" -f $script:ApiBaseUrl
+            $clusterUrl = "$($script:ApiBaseUrl)/clusters/list"
             $clusterBody = @{
                 kind = "cluster"
                 length = 500
@@ -194,7 +194,7 @@ function Get-NutanixVMList {
         try {
             Write-Verbose "Retrieving Nutanix VM information"
             
-            $vmUrl = "{0}/vms/list" -f $script:ApiBaseUrl
+            $vmUrl = "$($script:ApiBaseUrl)/vms/list"
             $vmBody = @{
                 kind = "vm"
                 length = 500
@@ -273,6 +273,12 @@ function Get-NutanixVMDetails {
             $vmDetails = @()
             
             foreach ($vm in $VMs) {
+                # Handle CPU usage calculation safely
+                $cpuUsage = 0
+                if ($vm.status.resources.power_state -eq "ON" -and $vm.status.resources.hypervisor_cpu_usage_ppm) {
+                    $cpuUsage = [math]::Round($vm.status.resources.hypervisor_cpu_usage_ppm / 10000, 2)
+                }
+                
                 $vmDetail = [PSCustomObject]@{
                     VMName = $vm.spec.name
                     VMID = $vm.metadata.uuid
@@ -280,7 +286,7 @@ function Get-NutanixVMDetails {
                     HostName = $vm.status.resources.host_reference.name
                     ClusterID = $vm.status.cluster_reference.uuid
                     ClusterName = $ClusterInfo[$vm.status.cluster_reference.uuid]
-                    CPUUsage = [math]::Round(($vm.status.resources.power_state -eq "ON" ? $vm.status.resources.hypervisor_cpu_usage_ppm / 10000 : 0), 2)
+                    CPUUsage = $cpuUsage
                     PowerState = $vm.status.resources.power_state
                 }
                 
@@ -446,25 +452,23 @@ function Start-VMHostMigrationMonitor {
                     
                     # If there are migrations, report and export them
                     if ($migrations.Count -gt 0) {
-                        Write-Host ("{0} VM migrations detected at {1}" -f $migrations.Count, (Get-Date -Format "yyyy-MM-dd HH:mm:ss"))
+                        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                        Write-Host "$($migrations.Count) VM migrations detected at $timestamp"
                         
                         foreach ($migration in $migrations) {
-                            Write-Host ("VM: {0} | CPU: {1}% | New Host: {2} | Previous Host: {3} | Cluster: {4}" -f 
-                                $migration.VMName, 
-                                $migration.VMCpuUsage, 
-                                $migration.HostName_New, 
-                                $migration.HostName_Previous, 
-                                $migration.ClusterName)
+                            Write-Host "VM: $($migration.VMName) | CPU: $($migration.VMCpuUsage)% | New Host: $($migration.HostName_New) | Previous Host: $($migration.HostName_Previous) | Cluster: $($migration.ClusterName)"
                         }
                         
                         Export-MigrationsToCsv -Migrations $migrations -CsvFilePath $CsvFilePath
                     }
                     else {
-                        Write-Host ("No VM migrations detected at {0}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"))
+                        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                        Write-Host "No VM migrations detected at $timestamp"
                     }
                 }
                 else {
-                    Write-Host ("Initial VM data collected at {0}, monitoring for changes..." -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"))
+                    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                    Write-Host "Initial VM data collected at $timestamp, monitoring for changes..."
                 }
                 
                 # Update previous VM details
