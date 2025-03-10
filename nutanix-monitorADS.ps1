@@ -1,30 +1,24 @@
 #Requires -Version 5.1
+
 <#
 .SYNOPSIS
-    Monitors Nutanix VMs for host changes through Prism Central API.
-
+    Monitors Nutanix VMs for host migrations via Prism Central API
 .DESCRIPTION
-    This script connects to Nutanix Prism Central REST API, retrieves VM information,
-    and monitors for host changes. It runs in a loop at specified intervals and
-    logs any changes to a CSV file.
-
+    This script connects to Nutanix Prism Central, retrieves VM information
+    at specified intervals, and reports when VMs migrate between hosts.
+    Results are displayed and saved to a CSV file.
 .PARAMETER PrismCentralAddress
-    The address of the Nutanix Prism Central server.
-
-.PARAMETER OutputCsvPath
-    Path to the CSV file where results will be saved.
-
-.PARAMETER DataRetrievalIntervalSeconds
-    How often to query the API (in seconds). Default is 60 seconds (1 minute).
-
-.PARAMETER MaxScriptRuntimeMinutes
-    Maximum time for the script to run (in minutes). Default is 60 minutes.
-
+    The address of the Nutanix Prism Central server
+.PARAMETER CsvFilePath
+    Path and filename for the CSV output
+.PARAMETER DataRetrievalInterval
+    Interval in minutes between API calls (default: 1)
+.PARAMETER MaxScriptRuntimeMin
+    Maximum runtime in minutes for the script (default: 60)
 .PARAMETER MaxAttemptsWhenError
-    Maximum number of retry attempts when encountering API errors. Default is 3.
-
+    Maximum number of retry attempts when an API call fails (default: 3)
 .EXAMPLE
-    .\NutanixVMMonitor.ps1 -PrismCentralAddress "prism.example.com" -OutputCsvPath "vm_changes.csv" -DataRetrievalIntervalSeconds 60 -MaxScriptRuntimeMinutes 120 -MaxAttemptsWhenError 5
+    .\Nutanix-VM-Migration-Monitor.ps1 -PrismCentralAddress "prism.example.com" -CsvFilePath "vm-migrations.csv" -DataRetrievalInterval 5 -MaxScriptRuntimeMin 120 -MaxAttemptsWhenError 5
 #>
 
 [CmdletBinding()]
@@ -33,13 +27,13 @@ param (
     [string]$PrismCentralAddress,
     
     [Parameter(Mandatory = $true)]
-    [string]$OutputCsvPath,
+    [string]$CsvFilePath,
     
     [Parameter(Mandatory = $false)]
-    [int]$DataRetrievalIntervalSeconds = 60,
+    [int]$DataRetrievalInterval = 1,
     
     [Parameter(Mandatory = $false)]
-    [int]$MaxScriptRuntimeMinutes = 60,
+    [int]$MaxScriptRuntimeMin = 60,
     
     [Parameter(Mandatory = $false)]
     [int]$MaxAttemptsWhenError = 3
@@ -47,13 +41,37 @@ param (
 
 #region Functions
 
-function Initialize-NutanixConnection {
-    <#
-    .SYNOPSIS
-        Initializes connection parameters for Nutanix Prism Central API.
-    .DESCRIPTION
-        Sets up connection details including API endpoint URLs and credentials.
-    #>
+function Initialize-Environment {
+    [CmdletBinding()]
+    param()
+    
+    process {
+        Write-Verbose "Initializing environment settings"
+        
+        # Force TLS 1.2
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        
+        # Ignore SSL certificate errors if needed
+        if ($PSVersionTable.PSVersion.Major -ge 6) {
+            $script:SkipCertificateCheck = @{SkipCertificateCheck = $true}
+        }
+        else {
+            Add-Type -TypeDefinition @"
+using System.Net;
+using System.Security.Cryptography.X509Certificates;
+public class TrustAllCertsPolicy : ICertificatePolicy {
+    public bool CheckValidationResult(ServicePoint srvPoint, X509Certificate certificate, WebRequest request, int certificateProblem) {
+        return true;
+    }
+}
+"@
+            [System.Net.ServicePointManager]::CertificatePolicy = New-Object -TypeName TrustAllCertsPolicy
+            $script:SkipCertificateCheck = @{}
+        }
+    }
+}
+
+function Connect-NutanixAPI {
     [CmdletBinding()]
     param (
         [Parameter(Mandatory = $true)]
@@ -62,400 +80,433 @@ function Initialize-NutanixConnection {
     
     process {
         try {
-            # Configure TLS 1.2
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Write-Verbose "Prompting for Nutanix credentials"
+            $credentials = Get-Credential -Message "Enter credentials for Nutanix Prism Central ($PrismCentralAddress)"
             
-            # Get credentials
-            Write-Host "Enter credentials for Nutanix Prism Central"
-            $credentials = Get-Credential
-            
-            # Create auth header
-            $authHeader = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(("{0}:{1}" -f $credentials.UserName, $credentials.GetNetworkCredential().Password)))
-            
-            # Set up connection details
-            $connectionInfo = @{
-                BaseUrl = "https://{0}:9440/api/nutanix/v3" -f $PrismCentralAddress
-                Headers = @{
-                    "Content-Type" = "application/json"
-                    "Accept" = "application/json"
-                    "Authorization" = "Basic $authHeader"
-                }
+            if (-not $credentials) {
+                throw "Credentials are required to connect to Nutanix Prism Central"
             }
             
-            Write-Verbose -Message ("Connection initialized for Nutanix Prism Central at {0}" -f $PrismCentralAddress)
-            return $connectionInfo
+            $base64AuthInfo = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(
+                "{0}:{1}" -f $credentials.UserName, $credentials.GetNetworkCredential().Password))
+            
+            $script:Headers = @{
+                "Authorization" = "Basic $base64AuthInfo"
+                "Content-Type" = "application/json"
+                "Accept" = "application/json"
+            }
+            
+            $apiBase = "https://{0}:9440/api/nutanix/v3" -f $PrismCentralAddress
+            $script:ApiBaseUrl = $apiBase
+            
+            # Test connection
+            $testUrl = "{0}/clusters" -f $apiBase
+            $testParams = @{
+                Method = "GET"
+                Uri = $testUrl
+                Headers = $script:Headers
+                ErrorAction = "Stop"
+            }
+            
+            if ($PSVersionTable.PSVersion.Major -ge 6) {
+                $testParams += $script:SkipCertificateCheck
+            }
+            
+            $testResult = Invoke-RestMethod @testParams
+            
+            Write-Verbose "Successfully connected to Nutanix Prism Central API"
+            return $true
         }
         catch {
-            $errorMessage = "Failed to initialize connection: {0}" -f $_.Exception.Message
-            Write-Error -Message $errorMessage
-            throw $errorMessage
+            Write-Error "Failed to connect to Nutanix Prism Central: $_"
+            return $false
         }
     }
 }
 
-function Invoke-NutanixApiRequest {
-    <#
-    .SYNOPSIS
-        Executes a REST API request to Nutanix Prism Central.
-    .DESCRIPTION
-        Makes an HTTP request to the Nutanix API with error handling and retry logic.
-    #>
+function Get-NutanixClusterInfo {
     [CmdletBinding()]
-    param (
-        [Parameter(Mandatory = $true)]
-        [hashtable]$ConnectionInfo,
-        
-        [Parameter(Mandatory = $true)]
-        [string]$Endpoint,
-        
-        [Parameter(Mandatory = $false)]
-        [Microsoft.PowerShell.Commands.WebRequestMethod]$Method = "POST",
-        
-        [Parameter(Mandatory = $false)]
-        [string]$Body = $null,
-        
-        [Parameter(Mandatory = $false)]
-        [int]$MaxAttempts = 3
-    )
+    param()
     
     process {
-        $uri = "{0}/{1}" -f $ConnectionInfo.BaseUrl, $Endpoint
-        $attemptCount = 0
-        $success = $false
-        $result = $null
-        
-        while (-not $success -and $attemptCount -lt $MaxAttempts) {
-            $attemptCount++
-            try {
+        try {
+            Write-Verbose "Retrieving Nutanix cluster information"
+            
+            $clusterUrl = "{0}/clusters/list" -f $script:ApiBaseUrl
+            $clusterBody = @{
+                kind = "cluster"
+                length = 500
+            } | ConvertTo-Json
+            
+            $clusters = @{}
+            $offset = 0
+            $totalEntities = 501 # Set higher than length to ensure first page runs
+            
+            while ($offset -lt $totalEntities) {
+                $pageBody = $clusterBody | ConvertFrom-Json
+                $pageBody.offset = $offset
+                $pageBodyJson = $pageBody | ConvertTo-Json
+                
                 $params = @{
-                    Uri = $uri
-                    Method = $Method
-                    Headers = $ConnectionInfo.Headers
-                    ContentType = "application/json"
-                    UseBasicParsing = $true
+                    Method = "POST"
+                    Uri = $clusterUrl
+                    Headers = $script:Headers
+                    Body = $pageBodyJson
                     ErrorAction = "Stop"
                 }
                 
-                if (-not [string]::IsNullOrEmpty($Body)) {
-                    $params.Add("Body", $Body)
-                }
-                
-                # Use different syntax based on PowerShell version
                 if ($PSVersionTable.PSVersion.Major -ge 6) {
-                    $params.Add("SkipCertificateCheck", $true)
-                    $response = Invoke-RestMethod @params
-                }
-                else {
-                    # Ignore certificate validation for PowerShell 5.1
-                    if (-not ([System.Management.Automation.PSTypeName]'TrustAllCertsPolicy').Type) {
-                        Add-Type -TypeDefinition @"
-                        using System.Net;
-                        using System.Security.Cryptography.X509Certificates;
-                        public class TrustAllCertsPolicy : ICertificatePolicy {
-                            public bool CheckValidationResult(
-                                ServicePoint srvPoint, X509Certificate certificate,
-                                WebRequest request, int certificateProblem) {
-                                return true;
-                            }
-                        }
-"@
-                    }
-                    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
-                    $response = Invoke-RestMethod @params
+                    $params += $script:SkipCertificateCheck
                 }
                 
-                $success = $true
-                $result = $response
-                Write-Verbose -Message ("API request to {0} successful" -f $Endpoint)
+                $response = Invoke-RestMethod @params
+                
+                $totalEntities = $response.metadata.total_matches
+                
+                foreach ($entity in $response.entities) {
+                    $clusters[$entity.metadata.uuid] = $entity.spec.name
+                }
+                
+                $offset += $response.entities.Count
+                
+                if ($response.entities.Count -eq 0) {
+                    break
+                }
             }
-            catch {
-                $errorMessage = "Attempt {0}/{1}: API request to {2} failed: {3}" -f $attemptCount, $MaxAttempts, $Endpoint, $_.Exception.Message
-                Write-Warning -Message $errorMessage
-                
-                if ($attemptCount -ge $MaxAttempts) {
-                    Write-Error -Message ("Maximum retry attempts reached for API request to {0}" -f $Endpoint)
-                    throw $_
-                }
-                
-                # Wait before retrying with exponential backoff
-                $backoffSeconds = [math]::Pow(2, $attemptCount)
-                Write-Verbose -Message ("Waiting {0} seconds before retry..." -f $backoffSeconds)
-                Start-Sleep -Seconds $backoffSeconds
-            }
+            
+            return $clusters
         }
-        
-        return $result
+        catch {
+            Write-Error "Failed to retrieve cluster information: $_"
+            return @{}
+        }
     }
 }
 
-function Get-NutanixVmList {
-    <#
-    .SYNOPSIS
-        Retrieves the list of VMs from Nutanix Prism Central.
-    .DESCRIPTION
-        Queries the Nutanix API to get information about all VMs including their host assignments.
-    #>
+function Get-NutanixVMList {
     [CmdletBinding()]
     param (
-        [Parameter(Mandatory = $true)]
-        [hashtable]$ConnectionInfo,
-        
         [Parameter(Mandatory = $false)]
-        [int]$MaxAttempts = 3
+        [int]$AttemptCount = 0
     )
     
     process {
         try {
-            # Request body for VM list query
-            $body = @{
+            Write-Verbose "Retrieving Nutanix VM information"
+            
+            $vmUrl = "{0}/vms/list" -f $script:ApiBaseUrl
+            $vmBody = @{
                 kind = "vm"
-                length = 500  # Adjust based on your environment size
-                offset = 0
-                filter = ""
+                length = 500
             } | ConvertTo-Json
             
-            # Get VM list
-            $vmListResponse = Invoke-NutanixApiRequest -ConnectionInfo $ConnectionInfo -Endpoint "vms/list" -Body $body -MaxAttempts $MaxAttempts
+            $vms = @()
+            $offset = 0
+            $totalEntities = 501 # Set higher than length to ensure first page runs
             
-            # Process VM list to extract required information
-            $vmList = @()
-            foreach ($vm in $vmListResponse.entities) {
-                # Get VM host information
-                $hostUuid = $vm.status.resources.host_reference.uuid
-                $hostName = $vm.status.resources.host_reference.name
+            while ($offset -lt $totalEntities) {
+                $pageBody = $vmBody | ConvertFrom-Json
+                $pageBody.offset = $offset
+                $pageBodyJson = $pageBody | ConvertTo-Json
                 
-                # Get cluster information
-                $clusterUuid = $vm.status.cluster_reference.uuid
-                $clusterName = $vm.status.cluster_reference.name
-                
-                # Get CPU usage
-                $cpuUsage = 0
-                if ($vm.status.resources.PSObject.Properties.Name -contains "usage_stats" -and 
-                    $vm.status.resources.usage_stats.PSObject.Properties.Name -contains "cpu_usage_ppm") {
-                    $cpuUsage = [math]::Round(($vm.status.resources.usage_stats.cpu_usage_ppm / 10000), 2)
+                $params = @{
+                    Method = "POST"
+                    Uri = $vmUrl
+                    Headers = $script:Headers
+                    Body = $pageBodyJson
+                    ErrorAction = "Stop"
                 }
                 
-                # Create VM object
-                $vmInfo = [PSCustomObject]@{
-                    VMName = $vm.status.name
-                    VMCPU_Usage = $cpuUsage
-                    HostName = $hostName
-                    HostUuid = $hostUuid
-                    ClusterName = $clusterName
-                    ClusterUuid = $clusterUuid
-                    PrismCentral = $PrismCentralAddress
+                if ($PSVersionTable.PSVersion.Major -ge 6) {
+                    $params += $script:SkipCertificateCheck
                 }
                 
-                $vmList += $vmInfo
-            }
-            
-            return $vmList
-        }
-        catch {
-            $errorMessage = "Failed to retrieve VM list: {0}" -f $_.Exception.Message
-            Write-Error -Message $errorMessage
-            throw $errorMessage
-        }
-    }
-}
-
-function Compare-VMHostChanges {
-    <#
-    .SYNOPSIS
-        Compares current VM host assignments with previous results.
-    .DESCRIPTION
-        Identifies VMs that have moved to different hosts between two data collections.
-    #>
-    [CmdletBinding()]
-    param (
-        [Parameter(Mandatory = $true)]
-        [array]$CurrentVMs,
-        
-        [Parameter(Mandatory = $true)]
-        [array]$PreviousVMs
-    )
-    
-    process {
-        try {
-            $changes = @()
-            $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-            
-            foreach ($currentVM in $CurrentVMs) {
-                $previousVM = $PreviousVMs | Where-Object { $_.VMName -eq $currentVM.VMName }
+                $response = Invoke-RestMethod @params
                 
-                if ($previousVM -and $currentVM.HostName -ne $previousVM.HostName) {
-                    $change = [PSCustomObject]@{
-                        Timestamp = $timestamp
-                        VMName = $currentVM.VMName
-                        VMCPU_Usage = $currentVM.VMCPU_Usage
-                        HostName_New = $currentVM.HostName
-                        HostName_Previous = $previousVM.HostName
-                        PrismCentral = $currentVM.PrismCentral
-                        ClusterName = $currentVM.ClusterName
-                    }
-                    
-                    $changes += $change
+                $totalEntities = $response.metadata.total_matches
+                
+                $vms += $response.entities
+                
+                $offset += $response.entities.Count
+                
+                if ($response.entities.Count -eq 0) {
+                    break
                 }
             }
             
-            return $changes
+            return $vms
         }
         catch {
-            $errorMessage = "Failed to compare VM host changes: {0}" -f $_.Exception.Message
-            Write-Error -Message $errorMessage
-            throw $errorMessage
-        }
-    }
-}
-
-function Export-ChangesToCsv {
-    <#
-    .SYNOPSIS
-        Exports VM host changes to a CSV file.
-    .DESCRIPTION
-        Appends detected host changes to the specified CSV file.
-    #>
-    [CmdletBinding()]
-    param (
-        [Parameter(Mandatory = $true)]
-        [array]$Changes,
-        
-        [Parameter(Mandatory = $true)]
-        [string]$CsvPath
-    )
-    
-    process {
-        try {
-            if ($Changes.Count -gt 0) {
-                # Create directory if it doesn't exist
-                $directory = Split-Path -Path $CsvPath -Parent
-                if (-not [string]::IsNullOrEmpty($directory) -and -not (Test-Path -Path $directory)) {
-                    New-Item -Path $directory -ItemType Directory -Force | Out-Null
-                }
-                
-                # Check if file exists to determine if header is needed
-                $fileExists = Test-Path -Path $CsvPath
-                
-                # Export to CSV
-                $Changes | Export-Csv -Path $CsvPath -NoTypeInformation -Append:$fileExists
-                
-                Write-Verbose -Message ("{0} VM host changes exported to {1}" -f $Changes.Count, $CsvPath)
+            Write-Error "Failed to retrieve VM information: $_"
+            
+            if ($AttemptCount -lt $MaxAttemptsWhenError) {
+                $nextAttempt = $AttemptCount + 1
+                Write-Warning "Retry attempt $nextAttempt of $MaxAttemptsWhenError for VM list retrieval"
+                Start-Sleep -Seconds 10
+                return Get-NutanixVMList -AttemptCount $nextAttempt
             }
             else {
-                Write-Verbose -Message "No VM host changes to export"
+                Write-Error "Maximum retry attempts reached. Returning empty VM list."
+                return @()
             }
-        }
-        catch {
-            $errorMessage = "Failed to export changes to CSV: {0}" -f $_.Exception.Message
-            Write-Error -Message $errorMessage
-            throw $errorMessage
         }
     }
 }
 
-function Start-VMHostMonitoring {
-    <#
-    .SYNOPSIS
-        Main function that orchestrates the VM host monitoring.
-    .DESCRIPTION
-        Runs monitoring loop at specified intervals to detect VM host changes.
-    #>
+function Get-NutanixVMDetails {
     [CmdletBinding()]
     param (
         [Parameter(Mandatory = $true)]
-        [hashtable]$ConnectionInfo,
+        [array]$VMs,
         
         [Parameter(Mandatory = $true)]
-        [string]$OutputCsvPath,
+        [hashtable]$ClusterInfo,
         
         [Parameter(Mandatory = $false)]
-        [int]$IntervalSeconds = 60,
-        
-        [Parameter(Mandatory = $false)]
-        [int]$MaxRuntimeMinutes = 60,
-        
-        [Parameter(Mandatory = $false)]
-        [int]$MaxAttempts = 3
+        [int]$AttemptCount = 0
     )
     
     process {
         try {
-            Write-Host "Starting VM host monitoring..."
-            Write-Host "Press Ctrl+C to stop the script at any time."
+            Write-Verbose "Processing VM details for $($VMs.Count) VMs"
             
-            # Calculate end time
-            $endTime = (Get-Date).AddMinutes($MaxRuntimeMinutes)
+            $vmDetails = @()
             
-            # Initialize previous VM list
-            $previousVMs = Get-NutanixVmList -ConnectionInfo $ConnectionInfo -MaxAttempts $MaxAttempts
-            Write-Host ("{0} - Initial VM data collected. Found {1} VMs." -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $previousVMs.Count)
-            
-            # Monitoring loop
-            while ((Get-Date) -lt $endTime) {
-                try {
-                    # Wait for the specified interval
-                    Start-Sleep -Seconds $IntervalSeconds
-                    
-                    # Get current VM list
-                    $currentVMs = Get-NutanixVmList -ConnectionInfo $ConnectionInfo -MaxAttempts $MaxAttempts
-                    Write-Host ("{0} - VM data collected. Found {1} VMs." -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $currentVMs.Count)
-                    
-                    # Compare and find changes
-                    $changes = Compare-VMHostChanges -CurrentVMs $currentVMs -PreviousVMs $previousVMs
-                    
-                    # Report and export changes
-                    if ($changes.Count -gt 0) {
-                        Write-Host ("{0} - Detected {1} VM host changes:" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $changes.Count) -ForegroundColor Yellow
-                        
-                        foreach ($change in $changes) {
-                            Write-Host ("  VM: {0} moved from {1} to {2}" -f $change.VMName, $change.HostName_Previous, $change.HostName_New) -ForegroundColor Yellow
-                        }
-                        
-                        # Export changes to CSV
-                        Export-ChangesToCsv -Changes $changes -CsvPath $OutputCsvPath
-                    }
-                    else {
-                        Write-Host ("{0} - No VM host changes detected." -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"))
-                    }
-                    
-                    # Update previous VM list for next iteration
-                    $previousVMs = $currentVMs
+            foreach ($vm in $VMs) {
+                $vmDetail = [PSCustomObject]@{
+                    VMName = $vm.spec.name
+                    VMID = $vm.metadata.uuid
+                    HostID = $vm.status.resources.host_reference.uuid
+                    HostName = $vm.status.resources.host_reference.name
+                    ClusterID = $vm.status.cluster_reference.uuid
+                    ClusterName = $ClusterInfo[$vm.status.cluster_reference.uuid]
+                    CPUUsage = [math]::Round(($vm.status.resources.power_state -eq "ON" ? $vm.status.resources.hypervisor_cpu_usage_ppm / 10000 : 0), 2)
+                    PowerState = $vm.status.resources.power_state
                 }
-                catch {
-                    $errorMessage = "Error during monitoring iteration: {0}" -f $_.Exception.Message
-                    Write-Warning -Message $errorMessage
-                    # Continue to next iteration despite errors
-                }
+                
+                $vmDetails += $vmDetail
             }
             
-            Write-Host ("{0} - Maximum runtime of {1} minutes reached. Monitoring stopped." -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $MaxRuntimeMinutes)
+            return $vmDetails
         }
         catch {
-            $errorMessage = "VM host monitoring failed: {0}" -f $_.Exception.Message
-            Write-Error -Message $errorMessage
-            throw $errorMessage
+            Write-Error "Failed to process VM details: $_"
+            
+            if ($AttemptCount -lt $MaxAttemptsWhenError) {
+                $nextAttempt = $AttemptCount + 1
+                Write-Warning "Retry attempt $nextAttempt of $MaxAttemptsWhenError for VM details processing"
+                Start-Sleep -Seconds 10
+                return Get-NutanixVMDetails -VMs $VMs -ClusterInfo $ClusterInfo -AttemptCount $nextAttempt
+            }
+            else {
+                Write-Error "Maximum retry attempts reached. Returning empty VM details."
+                return @()
+            }
         }
+    }
+}
+
+function Compare-VMHostMigrations {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [array]$CurrentVMDetails,
+        
+        [Parameter(Mandatory = $true)]
+        [array]$PreviousVMDetails,
+        
+        [Parameter(Mandatory = $true)]
+        [string]$PrismCentralAddress
+    )
+    
+    process {
+        Write-Verbose "Comparing VM host migrations"
+        
+        $migrations = @()
+        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        
+        foreach ($currentVM in $CurrentVMDetails) {
+            $previousVM = $PreviousVMDetails | Where-Object { $_.VMID -eq $currentVM.VMID }
+            
+            if ($previousVM -and $currentVM.HostID -ne $previousVM.HostID) {
+                $migration = [PSCustomObject]@{
+                    Timestamp = $timestamp
+                    VMName = $currentVM.VMName
+                    VMCpuUsage = $currentVM.CPUUsage
+                    HostName_New = $currentVM.HostName
+                    HostName_Previous = $previousVM.HostName
+                    PrismCentral = $PrismCentralAddress
+                    ClusterName = $currentVM.ClusterName
+                }
+                
+                $migrations += $migration
+            }
+        }
+        
+        return $migrations
+    }
+}
+
+function Export-MigrationsToCsv {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [array]$Migrations,
+        
+        [Parameter(Mandatory = $true)]
+        [string]$CsvFilePath
+    )
+    
+    process {
+        try {
+            Write-Verbose "Exporting migrations to CSV: $CsvFilePath"
+            
+            if (-not (Test-Path -Path $CsvFilePath -IsValid)) {
+                throw "Invalid CSV file path: $CsvFilePath"
+            }
+            
+            $csvFolder = Split-Path -Path $CsvFilePath -Parent
+            
+            if (-not [string]::IsNullOrEmpty($csvFolder) -and -not (Test-Path -Path $csvFolder)) {
+                New-Item -Path $csvFolder -ItemType Directory -Force | Out-Null
+            }
+            
+            # Append migrations to the CSV file
+            $Migrations | Export-Csv -Path $CsvFilePath -NoTypeInformation -Append
+            
+            Write-Verbose "Successfully exported $($Migrations.Count) migrations to CSV"
+        }
+        catch {
+            Write-Error "Failed to export migrations to CSV: $_"
+        }
+    }
+}
+
+function Start-VMHostMigrationMonitor {
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$PrismCentralAddress,
+        
+        [Parameter(Mandatory = $true)]
+        [string]$CsvFilePath,
+        
+        [Parameter(Mandatory = $true)]
+        [int]$DataRetrievalInterval,
+        
+        [Parameter(Mandatory = $true)]
+        [int]$MaxScriptRuntimeMin
+    )
+    
+    process {
+        Write-Host "Starting Nutanix VM Migration Monitor"
+        Write-Host "Prism Central: $PrismCentralAddress"
+        Write-Host "CSV File: $CsvFilePath"
+        Write-Host "Interval: $DataRetrievalInterval minute(s)"
+        Write-Host "Max Runtime: $MaxScriptRuntimeMin minute(s)"
+        Write-Host "Press Ctrl+C to stop the monitor"
+        Write-Host "----------------------------------------------"
+        
+        # Initialize previous VM details
+        $previousVMDetails = @()
+        
+        # Calculate end time
+        $endTime = (Get-Date).AddMinutes($MaxScriptRuntimeMin)
+        
+        # Get cluster information
+        $clusterInfo = Get-NutanixClusterInfo
+        
+        # Initialize CSV file with headers if it doesn't exist
+        if (-not (Test-Path -Path $CsvFilePath)) {
+            $csvHeaders = [PSCustomObject]@{
+                Timestamp = ""
+                VMName = ""
+                VMCpuUsage = ""
+                HostName_New = ""
+                HostName_Previous = ""
+                PrismCentral = ""
+                ClusterName = ""
+            }
+            
+            $csvHeaders | Export-Csv -Path $CsvFilePath -NoTypeInformation
+        }
+        
+        # Start monitoring loop
+        while ((Get-Date) -lt $endTime) {
+            $cycleStartTime = Get-Date
+            
+            try {
+                # Get current VM details
+                $vms = Get-NutanixVMList
+                $currentVMDetails = Get-NutanixVMDetails -VMs $vms -ClusterInfo $clusterInfo
+                
+                # If we have previous VM details, compare for migrations
+                if ($previousVMDetails.Count -gt 0) {
+                    $migrations = Compare-VMHostMigrations -CurrentVMDetails $currentVMDetails -PreviousVMDetails $previousVMDetails -PrismCentralAddress $PrismCentralAddress
+                    
+                    # If there are migrations, report and export them
+                    if ($migrations.Count -gt 0) {
+                        Write-Host ("{0} VM migrations detected at {1}" -f $migrations.Count, (Get-Date -Format "yyyy-MM-dd HH:mm:ss"))
+                        
+                        foreach ($migration in $migrations) {
+                            Write-Host ("VM: {0} | CPU: {1}% | New Host: {2} | Previous Host: {3} | Cluster: {4}" -f 
+                                $migration.VMName, 
+                                $migration.VMCpuUsage, 
+                                $migration.HostName_New, 
+                                $migration.HostName_Previous, 
+                                $migration.ClusterName)
+                        }
+                        
+                        Export-MigrationsToCsv -Migrations $migrations -CsvFilePath $CsvFilePath
+                    }
+                    else {
+                        Write-Host ("No VM migrations detected at {0}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"))
+                    }
+                }
+                else {
+                    Write-Host ("Initial VM data collected at {0}, monitoring for changes..." -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"))
+                }
+                
+                # Update previous VM details
+                $previousVMDetails = $currentVMDetails
+            }
+            catch {
+                Write-Error "Error in monitoring cycle: $_"
+            }
+            
+            # Calculate time to wait
+            $cycleEndTime = Get-Date
+            $cycleDuration = ($cycleEndTime - $cycleStartTime).TotalSeconds
+            $waitTimeSeconds = ($DataRetrievalInterval * 60) - $cycleDuration
+            
+            if ($waitTimeSeconds -gt 0) {
+                Write-Verbose "Waiting for $waitTimeSeconds seconds until next data collection"
+                Start-Sleep -Seconds $waitTimeSeconds
+            }
+        }
+        
+        Write-Host "Maximum script runtime reached. Monitoring stopped."
     }
 }
 
 #endregion
 
-#region Main Script
-
+# Main script execution
 try {
-    # Initialize connection to Nutanix Prism Central
-    $connectionInfo = Initialize-NutanixConnection -PrismCentralAddress $PrismCentralAddress
+    # Initialize environment
+    Initialize-Environment
     
-    # Start monitoring
-    Start-VMHostMonitoring -ConnectionInfo $connectionInfo `
-                          -OutputCsvPath $OutputCsvPath `
-                          -IntervalSeconds $DataRetrievalIntervalSeconds `
-                          -MaxRuntimeMinutes $MaxScriptRuntimeMinutes `
-                          -MaxAttempts $MaxAttemptsWhenError
+    # Connect to Nutanix API
+    $connected = Connect-NutanixAPI -PrismCentralAddress $PrismCentralAddress
+    
+    if (-not $connected) {
+        throw "Failed to connect to Nutanix Prism Central API"
+    }
+    
+    # Start monitor
+    Start-VMHostMigrationMonitor -PrismCentralAddress $PrismCentralAddress -CsvFilePath $CsvFilePath -DataRetrievalInterval $DataRetrievalInterval -MaxScriptRuntimeMin $MaxScriptRuntimeMin
 }
 catch {
-    Write-Error -Message "Script execution failed: $($_.Exception.Message)"
+    Write-Error "Script execution failed: $_"
     exit 1
 }
-
-#endregion
