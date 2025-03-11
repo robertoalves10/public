@@ -16,7 +16,7 @@
     Maximum number of retry attempts when API calls fail. Default is 3.
 .NOTES
     Author: Script generated per requirements
-    Date: March 10, 2025
+    Date: March 11, 2025
     Requirements: PowerShell 5.1 or 7, connectivity to Nutanix Prism Central
 #>
 [CmdletBinding()]
@@ -424,7 +424,8 @@ function Compare-VmHostAssignments {
         catch {
             $errorMessage = "Failed to compare VM host assignments: {0}" -f $_.Exception.Message
             Write-TimestampedMessage -Message $errorMessage -ForegroundColor Red
-            throw $errorMessage
+            # Return empty array instead of throwing exception
+            return @()
         }
     }
 }
@@ -439,6 +440,7 @@ function Export-VmChangesToCsv {
     [CmdletBinding()]
     param (
         [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
         [array]$ChangedVms,
         
         [Parameter(Mandatory = $true)]
@@ -447,10 +449,17 @@ function Export-VmChangesToCsv {
     
     process {
         try {
+            # Always ensure the array is initialized
+            if ($null -eq $ChangedVms) {
+                $ChangedVms = @()
+                Write-TimestampedMessage -Message "No changes to export (ChangedVms was null)"
+                return
+            }
+            
             if ($ChangedVms.Count -gt 0) {
                 # Create directory if it doesn't exist
                 $directory = Split-Path -Path $CsvFilePath -Parent
-                if (-not (Test-Path -Path $directory -PathType Container) -and $directory -ne "") {
+                if (-not [string]::IsNullOrEmpty($directory) -and -not (Test-Path -Path $directory -PathType Container)) {
                     New-Item -Path $directory -ItemType Directory -Force | Out-Null
                 }
                 
@@ -469,7 +478,7 @@ function Export-VmChangesToCsv {
         catch {
             $errorMessage = "Failed to export VM changes to CSV: {0}" -f $_.Exception.Message
             Write-TimestampedMessage -Message $errorMessage -ForegroundColor Red
-            throw $errorMessage
+            # Don't throw, just log error
         }
     }
 }
@@ -543,7 +552,7 @@ function Start-NutanixVmMonitoring {
                     # Compare with previous list to find changes
                     $changedVms = Compare-VmHostAssignments -CurrentVms $currentVms -PreviousVms $previousVms
                     
-                    # Export changes to CSV
+                    # Export changes to CSV (now handles null or empty arrays)
                     Export-VmChangesToCsv -ChangedVms $changedVms -CsvFilePath $CsvFilePath
                     
                     # Update previous VM list for next iteration
